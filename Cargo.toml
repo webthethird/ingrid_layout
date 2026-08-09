@@ -1,0 +1,26 @@
+[package]
+name = "ingrid_layout"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Crossword block-placement search, using ingrid_core as a fillability oracle"
+
+[dependencies]
+# Swap this for `path = "../ingrid_core"` to develop the two crates side by side, or point `branch`
+# at `rebus-support` to allow rebus squares in theme answers.
+ingrid_core = { git = "https://github.com/webthethird/ingrid_core", branch = "main" }
+clap = { version = "4.0.15", features = ["derive"] }
+rand = { version = "0.10.0", features = ["std", "alloc", "std_rng"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+
+[lib]
+name = "ingrid_layout"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ingrid_layout"
+path = "src/main.rs"
