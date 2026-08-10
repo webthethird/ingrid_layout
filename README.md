@@ -202,6 +202,9 @@ minutes. It's a genuinely harder problem than a 15×15, not just a bigger one.
 
 ## Development
 
+[TOUR.md](TOUR.md) is a guided read-through of the code, written for someone learning Rust: what each
+file does, which language ideas it uses, and a set of exercises that change something real.
+
 ```
 cargo test          # 24 tests; the geometry ones need no word list and run in well under a second
 cargo clippy --all-targets
