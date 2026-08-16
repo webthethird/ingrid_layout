@@ -13,7 +13,7 @@
 use rand::prelude::*;
 use rand::rngs::SmallRng;
 use std::collections::HashSet;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 /// The state of a single square during the layout search.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -918,6 +918,12 @@ pub struct SearchSettings {
     /// yields no legal topology at all would otherwise restart forever without ever handing the
     /// caller a chance to stop.
     pub deadline: Option<Instant>,
+    /// How often to call the progress callback. `None` never calls it.
+    ///
+    /// Progress has to be reported from inside the search for the same reason the deadline is
+    /// checked there: the interesting case is a theme that emits nothing at all, and a callback that
+    /// only fires on candidates says nothing precisely when you most want to hear something.
+    pub progress_interval: Option<Duration>,
 }
 
 impl Default for SearchSettings {
@@ -927,6 +933,7 @@ impl Default for SearchSettings {
             candidates_per_restart: 1,
             seed: 0,
             deadline: None,
+            progress_interval: None,
         }
     }
 }
@@ -939,18 +946,26 @@ pub struct SearchStats {
     pub complete_grids: usize,
     pub duplicates: usize,
     pub rejected_by_validation: usize,
+    /// Distinct topologies handed to `on_candidate`. The caller usually knows this already from its
+    /// own pool, but the progress callback can't see that pool -- it is borrowed by the candidate
+    /// callback -- so the count lives here.
+    pub candidates: usize,
 }
 
 /// Sample legal topologies, calling `on_candidate` with each distinct one.
 ///
 /// This is a sampler, not an enumerator: for a sparse theme the number of legal topologies is
 /// astronomical, so we run randomised restarts and let the caller stop when it has enough.
+///
+/// `on_progress` is called roughly every `settings.progress_interval` while the search runs, so a
+/// caller with a long deadline can tell a search that is grinding from one that is stuck.
 pub fn search(
     problem: &Problem,
     root: &Layout,
     settings: &SearchSettings,
     mut viability: Option<&mut (dyn EntryViability + '_)>,
     on_candidate: &mut dyn FnMut(&Layout, &SearchStats) -> Flow,
+    on_progress: Option<&mut dyn FnMut(&SearchStats)>,
 ) -> SearchStats {
     let mut state = SearchState {
         problem,
@@ -963,6 +978,11 @@ pub fn search(
         candidates_this_restart: 0,
         candidates_per_restart: settings.candidates_per_restart.max(1),
         on_candidate,
+        progress_interval: settings.progress_interval,
+        next_progress: settings
+            .progress_interval
+            .map(|interval| Instant::now() + interval),
+        on_progress,
     };
 
     loop {
@@ -989,7 +1009,10 @@ pub fn search(
 /// How often to consult the clock, in search nodes.
 const DEADLINE_CHECK_INTERVAL: usize = 512;
 
-struct SearchState<'a> {
+/// Two lifetimes because the two callbacks come from two independent borrows at the call site.
+/// `&mut` is invariant in its target, so a single `'a` shared by both would force the caller to
+/// prove the two borrows live exactly as long as each other -- which they don't.
+struct SearchState<'a, 'p> {
     problem: &'a Problem,
     rng: SmallRng,
     seen: HashSet<Vec<Cell>>,
@@ -1000,15 +1023,41 @@ struct SearchState<'a> {
     candidates_this_restart: usize,
     candidates_per_restart: usize,
     on_candidate: &'a mut dyn FnMut(&Layout, &SearchStats) -> Flow,
+    progress_interval: Option<Duration>,
+    /// When the next progress report is due, or `None` if progress isn't being reported.
+    next_progress: Option<Instant>,
+    on_progress: Option<&'p mut dyn FnMut(&SearchStats)>,
 }
 
-impl SearchState<'_> {
+impl SearchState<'_, '_> {
     /// Should this restart wind up, whether because it ran out of budget or time or because it has
     /// already produced its share of candidates?
     fn abandoning_restart(&self) -> bool {
         self.node_budget == 0
             || self.out_of_time
             || self.candidates_this_restart >= self.candidates_per_restart
+    }
+
+    /// Call the progress callback if one is installed and its interval has elapsed.
+    ///
+    /// The destructuring is what makes this compile: `self.on_progress` has to be borrowed mutably
+    /// to call the closure, and `self.stats` immutably to pass it, and the borrow checker only sees
+    /// those as two separate borrows once the fields are named individually.
+    fn report_progress(&mut self, now: Instant) {
+        let Some(due) = self.next_progress else { return };
+        if now < due {
+            return;
+        }
+        // From `now` rather than `due`, so a slow callback or a long gap between clock checks can't
+        // leave a backlog of reports that all fire at once.
+        self.next_progress = self.progress_interval.map(|interval| now + interval);
+
+        let SearchState {
+            on_progress, stats, ..
+        } = self;
+        if let Some(on_progress) = on_progress.as_deref_mut() {
+            on_progress(stats);
+        }
     }
 
     /// Depth-first from an already-propagated layout.
@@ -1022,9 +1071,13 @@ impl SearchState<'_> {
         self.node_budget -= 1;
         self.stats.nodes += 1;
 
+        // One clock reading serves both the deadline and the heartbeat: `Instant::now` is cheap but
+        // not free, and this runs on every node.
         if self.stats.nodes.is_multiple_of(DEADLINE_CHECK_INTERVAL) {
+            let now = Instant::now();
+            self.report_progress(now);
             if let Some(deadline) = self.deadline {
-                if Instant::now() >= deadline {
+                if now >= deadline {
                     self.out_of_time = true;
                     return Flow::Continue;
                 }
@@ -1082,6 +1135,7 @@ impl SearchState<'_> {
         // Only fresh grids count toward the cap, so a restart that turns up nothing but duplicates
         // still runs to completion and lets the caller notice the space is exhausted.
         self.candidates_this_restart += 1;
+        self.stats.candidates += 1;
 
         (self.on_candidate)(layout, &self.stats)
     }

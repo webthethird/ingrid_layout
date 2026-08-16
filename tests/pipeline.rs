@@ -187,6 +187,7 @@ fn the_search_rediscovers_a_fillable_grid_for_the_published_theme() {
             candidates_per_restart: 1,
             seed: 0,
             deadline: Some(std::time::Instant::now() + Duration::from_secs(30)),
+            progress_interval: None,
         },
         Some(&mut oracle as &mut dyn EntryViability),
         &mut |layout, _| {
@@ -197,6 +198,7 @@ fn the_search_rediscovers_a_fillable_grid_for_the_published_theme() {
                 Flow::Continue
             }
         },
+        None,
     );
 
     assert!(!pool.is_empty(), "the search found no legal topology");
