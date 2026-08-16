@@ -89,13 +89,68 @@ behind its score.
 --no-symmetry                       drop the 180-degree rotational symmetry requirement
 --count 5                           how many filled grids to return
 --pool 500                          legal topologies to sample before ranking
---timeout 120                       overall budget
+--timeout 120                       overall budget; 0 removes it and tries every topology sampled
 --fill-timeout                      per-grid fill budget
 --wordlist PATH --min-score 50      word list and quality bar
 --seed 0                            same seed, same grids
 --emit-templates                    geometry only, no filling
+--progress 5                        seconds between progress lines on stderr; 0 to silence them
 -v                                  search and oracle counters on stderr
 ```
+
+On a long `--timeout` the progress lines are how you tell a run that is working from one that is
+stuck. Sampling reports the topologies found so far, filling reports how the verdicts are trending:
+
+```
+[   2s] sampling: 46 of 500 topologies, 373760 nodes, 7827 restarts, 13 duplicates
+[  12s] filling: found 1 of 5 grids, tried 55 of 500 topologies (54 unfillable, 0 timed out, 0 with an impossible slot)
+```
+
+`-v` replaces the filling summary with one line per grid tried, and adds the counters. Progress goes
+to stderr, so redirecting stdout still gets you a clean file of grids.
+
+### Grids that time out
+
+`unfillable` is a proof and `timed out` is not — see [Verdicts](#verdicts) below. So every grid that
+times out is printed to stderr the moment it happens, while the solver moves on to the next one:
+
+```
+[  63s] grid 12 of 400 timed out after 5s -- unproven, so it may still fill. Fill it by hand, or
+        save it and rerun with a longer --fill-timeout:
+
+...#...#......#.....#
+.......#.............
+crosswordconstruction
+...
+```
+
+What it prints is a template in this tool's own input format, so the second half of that suggestion
+is literal: save those lines to a file, point `ingrid_layout` at it, and every square is already
+decided, so it skips straight to filling the one grid with whatever budget you give it.
+
+```
+ingrid_layout timed_out_1.txt --fill-timeout 300 --timeout 0
+```
+
+This one isn't governed by `--progress`, which only sets how often the running summary repeats. A
+timeout happens once and is worth seeing every time; `2>/dev/null` if you disagree.
+
+### Running without a time limit
+
+`--timeout 0` removes the overall budget: the sampler runs until it has `--pool` topologies, and
+then every one of them is tried, however long that takes. The other limits still apply —
+`--fill-timeout` bounds each individual grid, and the run still stops early once it has `--count`
+fillable grids, so pair `--timeout 0` with a large `--count` if you really want all of them tried.
+
+Two things to know before leaving one running:
+
+- Sampling can in principle spin. The search restarts with fresh randomness whenever a restart uses
+  up its node budget, and for a theme with legal-but-very-rare topologies that can repeat
+  indefinitely with nothing to stop it. The sampling progress line is the tell: nodes and restarts
+  climbing while the topology count stays at 0. Interrupt it and loosen `--max-short-entries` or the
+  block bounds.
+- Removing the clock doesn't turn a `timed out` verdict into an answer. Each grid still gets
+  `--fill-timeout` seconds and no more, so raise that too if the counters show fills timing out.
 
 ### Grid size
 
@@ -160,6 +215,27 @@ calls `find_fill`. Two things make this affordable:
 - Candidate words are cached per slot pattern. An empty slot's options depend only on its length, so
   all ~70 empty slots in every grid share one entry per length. Without this, each candidate rescans
   whole length buckets (STWL has ~20k five-letter and ~32k seven-letter words) once per slot.
+
+### Verdicts
+
+Each topology comes back as one of four verdicts, and the difference between the last two is the one
+that matters when you're deciding what to do about a disappointing run:
+
+| verdict | meaning |
+| --- | --- |
+| **filled** | a fill was found, and is scored and ranked |
+| **no word for a slot** | some slot matches nothing at all, found before any search — usually a theme answer stranding an awkward letter |
+| **unfillable** | a **proof**: either initial arc consistency wiped out a slot's domain, or the search exhausted the whole tree |
+| **timed out** | not a proof, just the clock — the solver never decided either way |
+
+Because the two failures are asymmetric, so are the fixes. A grid reported unfillable will not become
+fillable with a longer `--fill-timeout`; it needs a lower `--min-score` or a different grid, since the
+proof is only ever relative to the *filtered* word list. A grid that timed out may well fill given
+more time, which is why those get printed as they happen.
+
+The asymmetry is baked into `ingrid_core`: when a fill attempt exceeds its backtrack limit, `find_fill`
+doesn't give up, it grows the limit and retries with a fresh seed until the deadline. So a hard-but-
+fillable grid can only ever come back as `timed out`, never as `unfillable`.
 
 ## Calibration
 

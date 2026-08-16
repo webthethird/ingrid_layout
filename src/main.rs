@@ -12,7 +12,7 @@ use clap::Parser;
 
 use ingrid_core::word_list::{WordList, WordListSourceConfig, WordListSourceConfigProvider};
 use ingrid_layout::layout::{
-    parse_problem, search, Flow, Layout, LayoutSettings, SearchSettings, Symmetry,
+    parse_problem, search, Flow, Layout, LayoutSettings, SearchSettings, SearchStats, Symmetry,
 };
 use ingrid_layout::oracle::{Oracle, Verdict};
 use ingrid_layout::score::{fill_score, Candidate, Metrics, Weights};
@@ -63,7 +63,7 @@ struct Args {
     #[arg(long, default_value_t = 500)]
     pool: usize,
 
-    /// Overall time budget in seconds
+    /// Overall time budget in seconds; 0 removes the limit and tries every topology sampled
     #[arg(long, default_value_t = 120)]
     timeout: u64,
 
@@ -95,6 +95,10 @@ struct Args {
     /// Print search and oracle counters to stderr
     #[arg(short, long, default_value_t = false)]
     verbose: bool,
+
+    /// How often to print a progress line to stderr, in seconds; 0 turns progress off
+    #[arg(long, default_value_t = 5)]
+    progress: u64,
 }
 
 /// Conventional limits for a grid of this many squares.
@@ -151,7 +155,11 @@ impl Debug for Error {
 fn main() -> Result<(), Error> {
     let args = Args::parse();
     let start = Instant::now();
-    let deadline = start + Duration::from_secs(args.timeout);
+
+    // `--timeout 0` means "no overall limit". What still bounds the run is `--pool` (the sampler
+    // stops once it has that many topologies), `--count`, and `--fill-timeout` per grid; only the
+    // wall clock over the whole run goes away.
+    let deadline = (args.timeout > 0).then(|| start + Duration::from_secs(args.timeout));
 
     if args.count == 0 {
         return Err(Error("--count must be at least 1".into()));
@@ -194,6 +202,14 @@ fn main() -> Result<(), Error> {
 
     let (problem, root) = parse_problem(&raw_grid, settings).map_err(Error)?;
 
+    // Progress goes to stderr on its own, without `--verbose`: the whole point of it is to be there
+    // during a long run, and the person watching a long run isn't necessarily the person who wanted
+    // the counters. Piping stdout to a file still gets you a clean file.
+    let progress_interval = match args.progress {
+        0 => None,
+        secs => Some(Duration::from_secs(secs)),
+    };
+
     if args.verbose {
         eprintln!(
             "{}x{} grid, {} theme {} to place",
@@ -228,6 +244,10 @@ fn main() -> Result<(), Error> {
     let mut oracle = if args.emit_templates {
         None
     } else {
+        // Loading Spread the Wordlist takes seconds, and it happens before anything else prints.
+        if progress_interval.is_some() {
+            eprintln!("{} loading word list", stamp(start.elapsed()));
+        }
         Some(load_oracle(&args, &problem)?)
     };
 
@@ -236,11 +256,12 @@ fn main() -> Result<(), Error> {
     }
 
     // Reserve part of the budget for filling. Sampling topologies is cheap by comparison, so it
-    // should never be what uses up the clock.
-    let search_deadline = if args.emit_templates {
-        deadline
-    } else {
-        start + Duration::from_secs(args.timeout).mul_f64(0.35)
+    // should never be what uses up the clock. With no overall deadline there is nothing to divide,
+    // and the sampler runs until `--pool` is full.
+    let search_deadline = match deadline {
+        Some(deadline) if args.emit_templates => Some(deadline),
+        Some(_) => Some(start + Duration::from_secs(args.timeout).mul_f64(0.35)),
+        None => None,
     };
 
     let mut pool: Vec<Layout> = vec![];
@@ -251,7 +272,8 @@ fn main() -> Result<(), Error> {
             nodes_per_restart: 40_000,
             candidates_per_restart: 1,
             seed: args.seed,
-            deadline: Some(search_deadline),
+            deadline: search_deadline,
+            progress_interval,
         },
         oracle
             .as_mut()
@@ -264,6 +286,20 @@ fn main() -> Result<(), Error> {
                 Flow::Continue
             }
         },
+        // Passed unconditionally; `progress_interval: None` is what turns it off. Reports
+        // `stats.candidates` rather than `pool.len()` because `pool` is already borrowed by the
+        // candidate callback above, and two closures can't hold it mutably at once.
+        Some(&mut |stats: &SearchStats| {
+            eprintln!(
+                "{} sampling: {} of {} topologies, {} nodes, {} restarts, {} duplicates",
+                stamp(start.elapsed()),
+                stats.candidates,
+                args.pool,
+                stats.nodes,
+                stats.restarts,
+                stats.duplicates,
+            );
+        }),
     );
 
     if args.verbose {
@@ -273,6 +309,15 @@ fn main() -> Result<(), Error> {
             start.elapsed(),
             search_stats.nodes,
             search_stats.restarts
+        );
+    } else if progress_interval.is_some() {
+        // The handover between the two phases, and the one number that explains a disappointing
+        // run better than any other: how big the pool the filling has to work with actually is.
+        eprintln!(
+            "{} sampled {} of {} topologies, now filling",
+            stamp(start.elapsed()),
+            pool.len(),
+            args.pool,
         );
     }
 
@@ -308,13 +353,62 @@ fn main() -> Result<(), Error> {
     let mut oracle = oracle.expect("the oracle is only skipped when emitting templates");
     let mut results: Vec<Candidate> = vec![];
     let mut printed_unfillable_example = false;
+    let attempts_available = ranked.len();
+    // A single fill attempt can run for the whole `--fill-timeout`, so the heartbeat can only fire
+    // between attempts. That still tells you the run is moving, and how the verdicts are trending.
+    let mut next_progress = progress_interval.map(|interval| Instant::now() + interval);
 
-    for (geometric_score, layout, metrics) in ranked {
-        if results.len() >= args.count || Instant::now() >= deadline {
+    for (attempt, (geometric_score, layout, metrics)) in ranked.into_iter().enumerate() {
+        if results.len() >= args.count || deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
             break;
         }
 
-        match oracle.evaluate(&problem, &layout, fill_timeout) {
+        let verdict = oracle.evaluate(&problem, &layout, fill_timeout);
+
+        // One line per attempt under `--verbose`, and a throttled summary otherwise, so the two
+        // don't say the same thing twice.
+        if args.verbose {
+            eprintln!(
+                "{} grid {} of {} (geometry {:.1}): {}",
+                stamp(start.elapsed()),
+                attempt + 1,
+                attempts_available,
+                geometric_score,
+                match &verdict {
+                    Verdict::Filled(report) => format!(
+                        "filled in {:.1}s, mean word score {:.1}",
+                        report.elapsed.as_secs_f64(),
+                        report.mean_word_score
+                    ),
+                    Verdict::NoWordForSlot { slot, pattern } =>
+                        format!("slot {slot} needs a word matching {pattern}"),
+                    Verdict::Unfillable => "the solver proved it unfillable".into(),
+                    Verdict::TimedOut => "gave up at the fill timeout".into(),
+                },
+            );
+        } else if let Some(due) = next_progress {
+            if Instant::now() >= due {
+                next_progress = progress_interval.map(|interval| Instant::now() + interval);
+                let stats = &oracle.stats;
+                eprintln!(
+                    "{} filling: found {} of {} grids, tried {} of {} topologies \
+                     ({} unfillable, {} timed out, {} with an impossible slot)",
+                    stamp(start.elapsed()),
+                    // `oracle.stats` already counts the attempt that just finished; `results` won't
+                    // until the match below pushes it.
+                    stats.filled,
+                    args.count,
+                    stats.attempts,
+                    attempts_available,
+                    stats.unfillable,
+                    stats.timed_out,
+                    stats.rejected_by_empty_slot,
+                );
+            }
+        }
+
+        match verdict {
             Verdict::Filled(report) => {
                 let total_score = geometric_score + fill_score(&report, &weights);
                 results.push(Candidate {
@@ -325,8 +419,25 @@ fn main() -> Result<(), Error> {
                     total_score,
                 });
             }
-            Verdict::NoWordForSlot { slot, pattern } if args.verbose => {
-                eprintln!("  rejected: slot {slot} needs a word matching {pattern}");
+            // A timeout is the one verdict that isn't an answer: the solver never proved anything
+            // about this grid, it just ran out of clock (see the `Verdict` docs). So print it as it
+            // happens rather than dropping it -- it is the one worth a longer budget or a human.
+            // Goes to stderr with the rest of the running commentary, so a redirected stdout still
+            // holds nothing but finished grids.
+            // Printed unconditionally, unlike the heartbeat: `--progress` sets how often to repeat a
+            // running summary, and a timeout isn't that. It happens once, and silencing a periodic
+            // ticker shouldn't throw away the one grid the solver couldn't answer for. `2>/dev/null`
+            // if you don't want them.
+            Verdict::TimedOut => {
+                eprintln!(
+                    "{} grid {} of {} timed out after {:?} -- unproven, so it may still fill. \
+                     Fill it by hand, or save it and rerun with a longer --fill-timeout:\n\n{}\n",
+                    stamp(start.elapsed()),
+                    attempt + 1,
+                    attempts_available,
+                    fill_timeout,
+                    layout.render(&problem),
+                );
             }
             // When nothing is filling, the single most useful thing to see is one of the grids that
             // didn't, so you can tell whether the block pattern or the theme is at fault.
@@ -374,11 +485,18 @@ fn main() -> Result<(), Error> {
     }
 
     if results.len() < args.count {
+        // Which limit actually stopped us is the useful part: raising `--pool` and raising
+        // `--timeout` fix different runs, and with `--timeout 0` only one of them is even possible.
+        let limit = if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            "within the time budget".to_string()
+        } else {
+            format!("in the {attempts_available} topologies sampled")
+        };
         eprintln!(
-            "\nOnly found {} fillable {} of the {} requested within the time budget.",
+            "\nOnly found {} fillable {} of the {} requested {limit}.",
             results.len(),
             if results.len() == 1 { "grid" } else { "grids" },
-            args.count
+            args.count,
         );
     }
 
@@ -420,6 +538,12 @@ fn load_oracle(args: &Args, problem: &ingrid_layout::layout::Problem) -> Result<
     }
 
     Ok(Oracle::new(word_list, args.min_score))
+}
+
+/// A short elapsed-time prefix for progress lines, e.g. `[  12s]`. `Duration`'s own `Debug` is too
+/// precise to scan down a column of them.
+fn stamp(elapsed: Duration) -> String {
+    format!("[{:>4}s]", elapsed.as_secs())
 }
 
 fn describe(metrics: &Metrics) -> String {

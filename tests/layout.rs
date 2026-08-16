@@ -286,6 +286,7 @@ fn every_sampled_grid_is_legal() {
             candidates_per_restart: 1,
             seed: 7,
             deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            progress_interval: None,
         },
         None,
         &mut |layout, _stats| {
@@ -317,6 +318,7 @@ fn every_sampled_grid_is_legal() {
                 Flow::Continue
             }
         },
+        None,
     );
 
     assert!(
@@ -346,6 +348,7 @@ fn sampled_grids_are_distinct() {
             candidates_per_restart: 1,
             seed: 11,
             deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            progress_interval: None,
         },
         None,
         &mut |layout, _| {
@@ -359,6 +362,7 @@ fn sampled_grids_are_distinct() {
                 Flow::Continue
             }
         },
+        None,
     );
 
     assert_eq!(seen.len(), 50);
@@ -385,6 +389,7 @@ fn theme_entries_survive_into_every_emitted_grid() {
             candidates_per_restart: 1,
             seed: 3,
             deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            progress_interval: None,
         },
         None,
         &mut |layout, _| {
@@ -406,6 +411,7 @@ fn theme_entries_survive_into_every_emitted_grid() {
                 Flow::Continue
             }
         },
+        None,
     );
     assert_eq!(count, 25);
 }
