@@ -286,6 +286,7 @@ fn every_sampled_grid_is_legal() {
             candidates_per_restart: 1,
             seed: 7,
             deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            barren_restart_limit: None,
             progress_interval: None,
         },
         None,
@@ -348,6 +349,7 @@ fn sampled_grids_are_distinct() {
             candidates_per_restart: 1,
             seed: 11,
             deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            barren_restart_limit: None,
             progress_interval: None,
         },
         None,
@@ -389,6 +391,7 @@ fn theme_entries_survive_into_every_emitted_grid() {
             candidates_per_restart: 1,
             seed: 3,
             deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            barren_restart_limit: None,
             progress_interval: None,
         },
         None,
@@ -414,6 +417,63 @@ fn theme_entries_survive_into_every_emitted_grid() {
         None,
     );
     assert_eq!(count, 25);
+}
+
+#[test]
+fn a_barren_search_gives_up_instead_of_restarting_until_the_deadline() {
+    // A word list holding nothing but 3s, 13s and 15s. That's the shape of the real problem: the
+    // theme answers are 13 and 15 so they're fine, the search gets going and builds a large tree,
+    // and the refusals only land once an *ordinary* entry's extent is pinned down deep inside it.
+    //
+    // Both ends of that range matter, and getting them wrong is how the first two attempts at this
+    // test failed. Refuse too little and legal grids exist, so the search isn't barren at all.
+    // Refuse too much -- 13s included -- and the theme answers themselves are rejected, which kills
+    // both children of the root, and the search correctly reports the space as *exhausted* rather
+    // than giving up. This limit is only for the case in between: a tree too big to finish and with
+    // nothing in it.
+    //
+    // Without a limit this restarts until the 60-second deadline. With one it stops after a bounded
+    // number of fruitless restarts and says so, which is what lets a caller with eleven other theme
+    // placements to get through move on to them.
+    struct OnlyThreesThirteensAndFifteens;
+    impl ingrid_layout::layout::EntryViability for OnlyThreesThirteensAndFifteens {
+        fn is_viable(&mut self, pattern: &[Option<char>]) -> bool {
+            !matches!(pattern.len(), 4..=12 | 14)
+        }
+    }
+
+    let settings = LayoutSettings {
+        min_blocks: 34,
+        max_blocks: 44,
+        max_words: 80,
+        max_short_entries: 24,
+        ..LayoutSettings::default()
+    };
+    let (problem, root) = parse(THEME_15, settings).unwrap();
+
+    let stats = search(
+        &problem,
+        &root,
+        &SearchSettings {
+            nodes_per_restart: 2_000,
+            candidates_per_restart: 1,
+            seed: 1,
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            barren_restart_limit: Some(5),
+            progress_interval: None,
+        },
+        Some(&mut OnlyThreesThirteensAndFifteens),
+        &mut |_, _| Flow::Continue,
+        None,
+    );
+
+    assert_eq!(stats.candidates, 0);
+    assert!(stats.gave_up_barren, "should have reported giving up: {stats:?}");
+    assert!(
+        stats.restarts <= 6,
+        "should have stopped near the limit, did {} restarts",
+        stats.restarts
+    );
 }
 
 #[test]

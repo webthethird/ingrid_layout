@@ -1,8 +1,9 @@
-//! `ingrid_layout`: given a grid with only the theme answers placed, work out where the black
-//! squares go.
+//! `ingrid_layout`: work out where a crossword's theme answers and black squares go.
 //!
-//! Runs in two stages. First sample a pool of legal topologies using geometry alone, then rank them
-//! and spend the expensive fill attempts on the most promising ones, best first.
+//! Three stages, each feeding the next. Decide where the theme answers sit (skipped when the grid
+//! file already says); sample a pool of legal block topologies for each placement using geometry
+//! alone; then rank the pool and spend the expensive fill attempts on the most promising grids,
+//! best first.
 
 use std::fmt::{Debug, Formatter};
 use std::fs;
@@ -12,10 +13,14 @@ use clap::Parser;
 
 use ingrid_core::word_list::{WordList, WordListSourceConfig, WordListSourceConfigProvider};
 use ingrid_layout::layout::{
-    parse_problem, search, Flow, Layout, LayoutSettings, SearchSettings, SearchStats, Symmetry,
+    build_problem, parse_template, search, Flow, Layout, LayoutSettings, SearchSettings,
+    SearchStats, Symmetry, Template,
 };
 use ingrid_layout::oracle::{Oracle, Verdict};
 use ingrid_layout::score::{fill_score, Candidate, Metrics, Weights};
+use ingrid_layout::theme::{
+    parse_answers, place, Placement, PlacementStats, ThemeSettings, ThemeWeights,
+};
 
 /// Bundled copy of Spread the Wordlist, by Brooke Husic and Enrique Henestroza Anguiano. Vendored
 /// so the tool works with no configuration and the crate builds from a fresh clone.
@@ -26,8 +31,35 @@ const STWL_RAW: &str = include_str!("../resources/spreadthewordlist.dict");
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Path to the theme grid: `?` for undecided squares, `#` for blocks you want to keep, `.` for
-    /// squares you want to stay open, and letters for the theme answers
-    grid_path: String,
+    /// squares you want to stay open, and letters for the theme answers. Optional if you give
+    /// `--answers` and `--size` instead
+    grid_path: Option<String>,
+
+    /// Path to a list of theme answers, one per line, for the tool to place itself. Blank lines and
+    /// `#` comments are ignored, and spaces and punctuation are dropped
+    #[arg(long)]
+    answers: Option<String>,
+
+    /// Grid size for `--answers` when there is no grid file, e.g. `15x15` or `15`
+    #[arg(long)]
+    size: Option<String>,
+
+    /// How many theme placements to sample before ranking them
+    #[arg(long, default_value_t = 12)]
+    theme_pool: usize,
+
+    /// Let theme answers run Down as well as Across
+    #[arg(long, default_value_t = false)]
+    theme_down: bool,
+
+    /// Allow two theme answers on adjacent rows
+    #[arg(long, default_value_t = false)]
+    stacked_themes: bool,
+
+    /// Allow a theme answer whose 180-degree mirror is an ordinary entry rather than another theme
+    /// answer. Needed when the answer lengths can't pair up
+    #[arg(long, default_value_t = false)]
+    loose_theme_symmetry: bool,
 
     /// Minimum length of an entry
     #[arg(long, default_value_t = 3)]
@@ -144,6 +176,36 @@ impl SizeDefaults {
     }
 }
 
+/// Consecutive fruitless restarts before a theme placement is abandoned, when there are others
+/// waiting.
+///
+/// This is a **backstop, not the main bound** -- that job belongs to the per-placement deadline
+/// slice, which is fair by construction and scales with `--timeout`. Set too low, this preempts the
+/// slice and throws away placements that were merely slow: a placement needing 37 restarts to find
+/// its first topology is entirely normal on a tight theme, so a limit of a dozen quietly discards
+/// working answers and reports them as hopeless. It only wants to be small enough that a genuinely
+/// empty search doesn't burn a long slice proving it.
+const BARREN_RESTART_LIMIT: usize = 100;
+
+/// What to do when placements come back with nothing.
+///
+/// The two causes want opposite fixes and the counters can't tell them apart, so this hands over the
+/// one experiment that can: `--emit-templates` runs the identical geometry search with the word list
+/// unplugged. Plenty of topologies means the geometry is fine and the dictionary is the wall; none
+/// means the grid and the bounds can't be satisfied at all, and no `--min-score` will help.
+const DIAGNOSE_BARREN: &str = "\
+Run the same command with --emit-templates to find out which half is at fault -- it does the same \
+geometry search without the word list, and takes seconds.
+
+  * Lots of topologies there, none here: the word list is the wall. Entries crossing two theme \
+answers often match nothing. Lower --min-score, or supply a bigger --wordlist.
+  * Nothing there either: the geometry itself is over-constrained. Widen --min-blocks/--max-blocks \
+(a partial grid that already pins blocks eats into that range), raise --max-words and \
+--max-short-entries, or free up squares in the grid file.
+
+Either way, a smaller --theme-pool gives each placement more of the budget, which is the better \
+trade when placements are this hard.";
+
 struct Error(String);
 
 impl Debug for Error {
@@ -165,18 +227,36 @@ fn main() -> Result<(), Error> {
         return Err(Error("--count must be at least 1".into()));
     }
 
-    let raw_grid = fs::read_to_string(&args.grid_path)
-        .map_err(|_| Error(format!("Couldn't read file '{}'", args.grid_path)))?;
+    // Either the grid file says how big the puzzle is, or `--size` does.
+    let template = match (&args.grid_path, &args.size) {
+        (Some(path), _) => {
+            let raw = fs::read_to_string(path)
+                .map_err(|_| Error(format!("Couldn't read file '{path}'")))?;
+            parse_template(&raw).map_err(Error)?
+        }
+        (None, Some(size)) => {
+            let (width, height) = parse_size(size)?;
+            Template::blank(width, height)
+        }
+        (None, None) => {
+            return Err(Error(
+                "Give a grid file, or --answers with --size (e.g. --answers theme.txt --size 15x15)."
+                    .into(),
+            ))
+        }
+    };
 
-    // Size the conventional limits to the grid in front of us. `parse_problem` re-derives and
-    // validates the dimensions; this only needs them well enough to pick defaults.
-    let rough_height = raw_grid.lines().filter(|line| !line.trim().is_empty()).count();
-    let rough_width = raw_grid
-        .lines()
-        .map(|line| line.trim().chars().count())
-        .max()
-        .unwrap_or(0);
-    let defaults = SizeDefaults::for_grid(rough_width, rough_height);
+    let answers = match &args.answers {
+        Some(path) => {
+            let raw = fs::read_to_string(path)
+                .map_err(|_| Error(format!("Couldn't read file '{path}'")))?;
+            Some(parse_answers(&raw).map_err(Error)?)
+        }
+        None => None,
+    };
+
+    // Size the conventional limits to the grid in front of us.
+    let defaults = SizeDefaults::for_grid(template.width, template.height);
 
     let min_blocks = args.min_blocks.unwrap_or(defaults.min_blocks);
     let max_blocks = args.max_blocks.unwrap_or(defaults.max_blocks);
@@ -200,8 +280,6 @@ fn main() -> Result<(), Error> {
         },
     };
 
-    let (problem, root) = parse_problem(&raw_grid, settings).map_err(Error)?;
-
     // Progress goes to stderr on its own, without `--verbose`: the whole point of it is to be there
     // during a long run, and the person watching a long run isn't necessarily the person who wanted
     // the counters. Piping stdout to a file still gets you a clean file.
@@ -211,28 +289,41 @@ fn main() -> Result<(), Error> {
     };
 
     if args.verbose {
-        eprintln!(
-            "{}x{} grid, {} theme {} to place",
-            problem.width,
-            problem.height,
-            problem.theme_entries.len(),
-            if problem.theme_entries.len() == 1 {
-                "answer"
-            } else {
-                "answers"
-            }
-        );
+        eprintln!("{}x{} grid", template.width, template.height);
         eprintln!(
             "  limits: {}-{} blocks, <={} entries, <={} minimum-length entries, {:?} per fill",
-            problem.settings.min_blocks,
-            problem.settings.max_blocks,
-            problem.settings.max_words,
-            problem.settings.max_short_entries,
+            settings.min_blocks,
+            settings.max_blocks,
+            settings.max_words,
+            settings.max_short_entries,
             fill_timeout,
         );
-        for theme in &problem.theme_entries {
+    }
+
+    // Stage one: where do the theme answers go? Before the word list loads, because that takes
+    // seconds and a theme with nowhere to go should say so immediately.
+    let theme_weights = ThemeWeights::default();
+    let placements = resolve_placements(
+        &args,
+        &template,
+        &settings,
+        answers.as_deref(),
+        &theme_weights,
+        deadline,
+    )?;
+    let placement_count = placements.len();
+
+    if args.verbose {
+        eprintln!(
+            "{} theme placement{} to try; best one (theme score {:.1}: {}):",
+            placements.len(),
+            if placements.len() == 1 { "" } else { "s" },
+            placements[0].score,
+            describe_placement(&placements[0].metrics),
+        );
+        for theme in placements[0].entries() {
             eprintln!(
-                "  {:>16} at {:?} {:?}",
+                "  {:>18} at {:?} {:?}",
                 theme.answer, theme.start, theme.direction
             );
         }
@@ -248,7 +339,7 @@ fn main() -> Result<(), Error> {
         if progress_interval.is_some() {
             eprintln!("{} loading word list", stamp(start.elapsed()));
         }
-        Some(load_oracle(&args, &problem)?)
+        Some(load_oracle(&args, template.width, template.height)?)
     };
 
     if args.verbose && oracle.is_some() {
@@ -264,48 +355,111 @@ fn main() -> Result<(), Error> {
         None => None,
     };
 
-    let mut pool: Vec<Layout> = vec![];
-    let search_stats = search(
-        &problem,
-        &root,
-        &SearchSettings {
-            nodes_per_restart: 40_000,
-            candidates_per_restart: 1,
-            seed: args.seed,
-            deadline: search_deadline,
-            progress_interval,
-        },
-        oracle
-            .as_mut()
-            .map(|oracle| oracle as &mut dyn ingrid_layout::layout::EntryViability),
-        &mut |layout, _stats| {
-            pool.push(layout.clone());
-            if pool.len() >= args.pool {
-                Flow::Stop
-            } else {
-                Flow::Continue
-            }
-        },
-        // Passed unconditionally; `progress_interval: None` is what turns it off. Reports
-        // `stats.candidates` rather than `pool.len()` because `pool` is already borrowed by the
-        // candidate callback above, and two closures can't hold it mutably at once.
-        Some(&mut |stats: &SearchStats| {
+    // Stage two: block topologies. Each theme placement gets an equal share of the pool, so a
+    // single lucky placement can't crowd the others out of the ranking before they are tried.
+    let mut pool: Vec<(usize, Layout)> = vec![];
+    let mut barren_placements = 0;
+    let per_placement = args.pool.div_ceil(placements.len());
+    let mut search_stats = SearchStats::default();
+
+    for (index, placement) in placements.iter().enumerate() {
+        if pool.len() >= args.pool
+            || search_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+        {
+            break;
+        }
+
+        // Its own slice of what's left, rather than the whole remaining budget. A theme placement
+        // whose topologies are rare makes the sampler grind -- the viability check rejects branch
+        // after branch -- and on a shared deadline the first such placement swallows the entire
+        // budget and the other eleven never run at all. Slicing what remains by how many are left
+        // keeps that local: a slow placement costs its own turn and nobody else's, and placements
+        // that finish early hand their unused time to the ones after them.
+        let placements_left = (placement_count - index) as u32;
+        let slice_deadline = search_deadline.map(|deadline| {
+            let now = Instant::now();
+            now + deadline.saturating_duration_since(now) / placements_left
+        });
+
+        let mut found_here = 0;
+        let stats = search(
+            &placement.problem,
+            &placement.root,
+            &SearchSettings {
+                nodes_per_restart: 40_000,
+                candidates_per_restart: 1,
+                // A different seed per placement, so two placements that happen to have the same
+                // shape don't explore it in the same order and hand back the same grids.
+                seed: args.seed.wrapping_add(index as u64),
+                deadline: slice_deadline,
+                // Only when there is more than one placement to get through. With a single one
+                // there is nothing else to spend the time on, so restarting until the deadline is
+                // exactly right; with twelve, a barren one has to be cut loose.
+                barren_restart_limit: (placement_count > 1).then_some(BARREN_RESTART_LIMIT),
+                progress_interval,
+            },
+            oracle
+                .as_mut()
+                .map(|oracle| oracle as &mut dyn ingrid_layout::layout::EntryViability),
+            &mut |layout, _stats| {
+                pool.push((index, layout.clone()));
+                found_here += 1;
+                if found_here >= per_placement || pool.len() >= args.pool {
+                    Flow::Stop
+                } else {
+                    Flow::Continue
+                }
+            },
+            // Passed unconditionally; `progress_interval: None` is what turns it off. Reports
+            // `stats.candidates` rather than `pool.len()` because `pool` is already borrowed by the
+            // candidate callback above, and two closures can't hold it mutably at once.
+            Some(&mut |stats: &SearchStats| {
+                eprintln!(
+                    "{} sampling: theme placement {} of {}, {} of {} topologies, {} nodes, \
+                     {} restarts, {} duplicates",
+                    stamp(start.elapsed()),
+                    index + 1,
+                    placement_count,
+                    stats.candidates,
+                    per_placement,
+                    stats.nodes,
+                    stats.restarts,
+                    stats.duplicates,
+                );
+            }),
+        );
+
+        search_stats.nodes += stats.nodes;
+        search_stats.restarts += stats.restarts;
+        search_stats.duplicates += stats.duplicates;
+
+        if found_here == 0 {
+            barren_placements += 1;
+        }
+        if args.verbose {
             eprintln!(
-                "{} sampling: {} of {} topologies, {} nodes, {} restarts, {} duplicates",
+                "{} theme placement {} of {}: {} topolog{} in {} restarts{}",
                 stamp(start.elapsed()),
-                stats.candidates,
-                args.pool,
-                stats.nodes,
+                index + 1,
+                placement_count,
+                found_here,
+                if found_here == 1 { "y" } else { "ies" },
                 stats.restarts,
-                stats.duplicates,
+                if stats.gave_up_barren {
+                    ", gave up (nothing legal turning up)"
+                } else {
+                    ""
+                },
             );
-        }),
-    );
+        }
+    }
 
     if args.verbose {
         eprintln!(
-            "sampled {} topologies in {:?} ({} search nodes, {} restarts)",
+            "sampled {} topologies across {} theme placement{} in {:?} ({} search nodes, {} restarts)",
             pool.len(),
+            placement_count,
+            if placement_count == 1 { "" } else { "s" },
             start.elapsed(),
             search_stats.nodes,
             search_stats.restarts
@@ -322,30 +476,45 @@ fn main() -> Result<(), Error> {
     }
 
     if pool.is_empty() {
-        return Err(Error(
-            "Found no legal block arrangement for this theme. Try widening --min-blocks/--max-blocks \
-             or --max-words, or moving the theme answers."
-                .into(),
-        ));
+        return Err(Error(format!(
+            "Found no legal block arrangement for any of the {placement_count} theme placement{}.\n\n\
+             {}",
+            if placement_count == 1 { "" } else { "s" },
+            DIAGNOSE_BARREN,
+        )));
+    }
+
+    // Barren placements are the loudest signal this run has to offer and they are otherwise only
+    // visible as progress lines scrolling past with a topology count stuck at zero. What makes them
+    // worth a line of their own is that the usual cause isn't the geometry -- it's the word list
+    // rejecting every entry the geometry builds, and `--min-score` is the knob for that, which
+    // nothing else in the output would point you towards.
+    if barren_placements > 0 && !args.emit_templates {
+        eprintln!(
+            "\n{barren_placements} of {placement_count} theme placements produced no legal grid at \
+             all.\n\n{DIAGNOSE_BARREN}\n"
+        );
     }
 
     let weights = Weights::default();
 
-    // Rank on geometry first so the expensive fill attempts go to the best-looking grids.
-    let mut ranked: Vec<(f64, Layout, Metrics)> = pool
+    // Rank on geometry first so the expensive fill attempts go to the best-looking grids. The theme
+    // placement's own score rides along, so grids from a better-shaped theme start ahead -- which
+    // is the only thing that makes one ranking over several placements meaningful.
+    let mut ranked: Vec<(f64, usize, Layout, Metrics)> = pool
         .into_iter()
-        .map(|layout| {
-            let metrics = Metrics::measure(&problem, &layout);
-            let score = metrics.geometric_score(&weights);
-            (score, layout, metrics)
+        .map(|(index, layout)| {
+            let metrics = Metrics::measure(&placements[index].problem, &layout);
+            let score = metrics.geometric_score(&weights) + placements[index].score;
+            (score, index, layout, metrics)
         })
         .collect();
     ranked.sort_by(|a, b| b.0.total_cmp(&a.0));
 
     if args.emit_templates {
-        for (score, layout, metrics) in ranked.iter().take(args.count) {
+        for (score, index, layout, metrics) in ranked.iter().take(args.count) {
             println!("# geometry score {score:.1}  {}", describe(metrics));
-            println!("{}\n", layout.render(&problem));
+            println!("{}\n", layout.render(&placements[*index].problem));
         }
         return Ok(());
     }
@@ -358,13 +527,14 @@ fn main() -> Result<(), Error> {
     // between attempts. That still tells you the run is moving, and how the verdicts are trending.
     let mut next_progress = progress_interval.map(|interval| Instant::now() + interval);
 
-    for (attempt, (geometric_score, layout, metrics)) in ranked.into_iter().enumerate() {
+    for (attempt, (geometric_score, index, layout, metrics)) in ranked.into_iter().enumerate() {
         if results.len() >= args.count || deadline.is_some_and(|deadline| Instant::now() >= deadline)
         {
             break;
         }
 
-        let verdict = oracle.evaluate(&problem, &layout, fill_timeout);
+        let problem = &placements[index].problem;
+        let verdict = oracle.evaluate(problem, &layout, fill_timeout);
 
         // One line per attempt under `--verbose`, and a throttled summary otherwise, so the two
         // don't say the same thing twice.
@@ -412,7 +582,7 @@ fn main() -> Result<(), Error> {
             Verdict::Filled(report) => {
                 let total_score = geometric_score + fill_score(&report, &weights);
                 results.push(Candidate {
-                    template: layout.render(&problem),
+                    template: layout.render(problem),
                     metrics,
                     geometric_score,
                     fill: Some(report),
@@ -436,7 +606,7 @@ fn main() -> Result<(), Error> {
                     attempt + 1,
                     attempts_available,
                     fill_timeout,
-                    layout.render(&problem),
+                    layout.render(problem),
                 );
             }
             // When nothing is filling, the single most useful thing to see is one of the grids that
@@ -445,7 +615,7 @@ fn main() -> Result<(), Error> {
                 printed_unfillable_example = true;
                 eprintln!(
                     "  first grid the solver proved unfillable:\n{}",
-                    layout.render(&problem)
+                    layout.render(problem)
                 );
             }
             _ => {}
@@ -503,7 +673,148 @@ fn main() -> Result<(), Error> {
     Ok(())
 }
 
-fn load_oracle(args: &Args, problem: &ingrid_layout::layout::Problem) -> Result<Oracle, Error> {
+/// Parse a `--size` argument: `15x15`, or `15` for a square grid.
+fn parse_size(text: &str) -> Result<(usize, usize), Error> {
+    let bad = || Error(format!("Couldn't read --size {text:?}; try `15x15` or `15`."));
+
+    let (width, height) = match text.to_lowercase().split_once('x') {
+        Some((w, h)) => (w.trim().to_string(), h.trim().to_string()),
+        None => (text.trim().to_string(), text.trim().to_string()),
+    };
+
+    let width: usize = width.parse().map_err(|_| bad())?;
+    let height: usize = height.parse().map_err(|_| bad())?;
+
+    if width == 0 || height == 0 {
+        return Err(bad());
+    }
+    Ok((width, height))
+}
+
+/// Stage one: decide where the theme answers go, or take the constructor's word for it.
+///
+/// Both arms come back as `Placement`s so the rest of the program doesn't have to care which
+/// happened -- a hand-placed theme is just a pool of exactly one.
+fn resolve_placements(
+    args: &Args,
+    template: &Template,
+    settings: &LayoutSettings,
+    answers: Option<&[String]>,
+    weights: &ThemeWeights,
+    deadline: Option<Instant>,
+) -> Result<Vec<Placement>, Error> {
+    let Some(answers) = answers else {
+        let (problem, root) = build_problem(template, settings.clone()).map_err(Error)?;
+        let pre_fixed = template
+            .fixed
+            .iter()
+            .filter(|cell| **cell == Some(ingrid_layout::layout::Cell::Block))
+            .count();
+        return Ok(vec![Placement::new(problem, root, pre_fixed, weights)]);
+    };
+
+    if args.theme_pool == 0 {
+        return Err(Error("--theme-pool must be at least 1".into()));
+    }
+
+    let theme_settings = ThemeSettings {
+        allow_down: args.theme_down,
+        require_pairing: !args.loose_theme_symmetry,
+        allow_stacked: args.stacked_themes,
+        nodes_per_restart: 20_000,
+        seed: args.seed,
+        // Placement is cheap next to filling, so it gets a small slice of the budget. Bounded all
+        // the same: a theme with no legal home at all would otherwise restart forever.
+        deadline: deadline.map(|deadline| {
+            let now = Instant::now();
+            now + (deadline - now).mul_f64(0.1)
+        }),
+    };
+
+    // Sample well past what we'll keep, then take the best. A placement costs a few hundred search
+    // nodes to find and nothing to score, while each one we keep costs a share of `--pool` and a
+    // run of fill attempts -- so it is much cheaper to be picky here than to be picky later.
+    //
+    // The multiplier is large because the space is small enough to nearly cover and the ranking is
+    // only as good as what it gets to choose from. Four answers in a 15x15 have some hundreds of
+    // legal arrangements; sampling 120 of them missed the one a human picked, and it missed it
+    // despite that arrangement scoring *highest* on our own metrics. Under-sampling looks exactly
+    // like a bad metric from the outside, which is what makes it worth spending nodes to rule out.
+    let sample_target = args.theme_pool.saturating_mul(40).max(600);
+
+    let mut found: Vec<Placement> = vec![];
+    let stats: PlacementStats = place(
+        template,
+        settings,
+        answers,
+        &theme_settings,
+        &mut |placement| {
+            found.push(placement);
+            if found.len() >= sample_target {
+                Flow::Stop
+            } else {
+                Flow::Continue
+            }
+        },
+    )
+    .map_err(Error)?;
+
+    if args.verbose {
+        eprintln!(
+            "theme placement: {} found, {} nodes, {} restarts, {} rejected by geometry",
+            found.len(),
+            stats.nodes,
+            stats.restarts,
+            stats.rejected_by_geometry,
+        );
+    }
+
+    if found.is_empty() {
+        return Err(Error(no_placement_message(args, stats)));
+    }
+
+    // Best-shaped theme first, then keep only as many as asked for: every placement kept costs a
+    // share of `--pool`, and a thin slice of topologies on a mediocre placement finds nothing.
+    found.sort_by(|a, b| b.score.total_cmp(&a.score));
+    found.truncate(args.theme_pool);
+    Ok(found)
+}
+
+/// The advice to give when the theme has nowhere to go. Which knob to reach for depends on *how* it
+/// failed, and the counters say: placements that propagation rejected mean the arrangement is too
+/// tight, while none even being attempted means the pairing rule ruled everything out up front.
+fn no_placement_message(args: &Args, stats: PlacementStats) -> String {
+    let mut message = String::from("Found nowhere to put these theme answers.");
+
+    if !args.loose_theme_symmetry {
+        message.push_str(
+            "\n\nMost likely the answer lengths can't pair up: with 180-degree symmetry, two \
+             answers mirror each other only if they're the same length, and a length with an odd \
+             number of answers has to put one of them dead centre — which two answers can't both \
+             do. Try --loose-theme-symmetry to let an answer's mirror be an ordinary entry.",
+        );
+    }
+    if stats.rejected_by_geometry > 0 {
+        message.push_str(&format!(
+            "\n\n{} arrangement{} were found and then rejected by the block rules, so the answers \
+             do fit but leave squares that can't reach --min-entry-length. Try --stacked-themes, \
+             or wider --min-blocks/--max-blocks.",
+            stats.rejected_by_geometry,
+            if stats.rejected_by_geometry == 1 {
+                ""
+            } else {
+                "s"
+            },
+        ));
+    }
+    if !args.theme_down {
+        message.push_str("\n\n--theme-down lets answers run downward as well as across.");
+    }
+
+    message
+}
+
+fn load_oracle(args: &Args, width: usize, height: usize) -> Result<Oracle, Error> {
     let word_list = WordList::new(
         vec![match &args.wordlist {
             Some(path) => WordListSourceConfig {
@@ -520,7 +831,7 @@ fn load_oracle(args: &Args, problem: &ingrid_layout::layout::Problem) -> Result<
             },
         }],
         None,
-        Some(problem.width.max(problem.height)),
+        Some(width.max(height)),
         args.max_shared_substring,
     );
 
@@ -546,15 +857,30 @@ fn stamp(elapsed: Duration) -> String {
     format!("[{:>4}s]", elapsed.as_secs())
 }
 
+fn describe_placement(metrics: &ingrid_layout::theme::PlacementMetrics) -> String {
+    format!(
+        "unpaired {}  outer-band {}  crossings {}  floating {}  stranded {}  forced blocks {}  free lines {}",
+        metrics.unpaired,
+        metrics.outer_band_entries,
+        metrics.crossings,
+        metrics.floating_entries,
+        metrics.stranded_squares,
+        metrics.forced_blocks,
+        metrics.min_free_lines,
+    )
+}
+
 fn describe(metrics: &Metrics) -> String {
     format!(
-        "blocks {}  words {}  short {}  long {}  cheaters {}  clump {}  hotspots {}",
+        "blocks {}  words {}  short {}  long {}  cheaters {}  clump {}  adj {}  fingers {}  hotspots {}",
         metrics.block_count,
         metrics.word_count,
         metrics.short_entries,
         metrics.long_entries,
         metrics.cheater_squares,
         metrics.largest_block_clump,
+        metrics.block_adjacencies,
+        metrics.side_fingers,
         metrics.theme_crossing_hotspots,
     )
 }

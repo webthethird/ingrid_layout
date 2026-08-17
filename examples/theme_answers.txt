@@ -1,0 +1,6 @@
+# A theme is just a list of answers; the tool works out where they go.
+# This is the theme of the puzzle in ingrid_core's README.
+Intimate Apparel
+Wisteria Lane
+Creme Brulees
+Going Into Detail

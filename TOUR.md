@@ -13,19 +13,20 @@ line number, so use your editor's "go to symbol" (or `grep -n "fn ensure_options
 
 ## The map
 
-About 1,900 lines of source and 700 of tests.
+About 2,300 lines of source and 700 of tests.
 
 | file | lines | what it does | why read it |
 | --- | --- | --- | --- |
-| [src/lib.rs](src/lib.rs) | 13 | declares the modules | 30 seconds, start here |
+| [src/lib.rs](src/lib.rs) | 14 | declares the modules | 30 seconds, start here |
 | [src/score.rs](src/score.rs) | 260 | ranks finished grids | plain functions over data; the gentlest file |
-| [src/layout.rs](src/layout.rs) | 1159 | the block-placement search | the heart of it; most of the Rust ideas live here |
+| [src/layout.rs](src/layout.rs) | 1306 | the block-placement search | the heart of it; most of the Rust ideas live here |
+| [src/theme.rs](src/theme.rs) | 750 | decides where the theme answers go | a second search built on the first; good for seeing a pattern reused |
 | [src/oracle.rs](src/oracle.rs) | 254 | asks `ingrid_core` whether a grid can be filled | where the borrow checker gets interesting |
-| [src/main.rs](src/main.rs) | 463 | the command-line program | argument parsing, wiring it all together |
+| [src/main.rs](src/main.rs) | 798 | the command-line program | argument parsing, wiring it all together |
 
-The dependency arrow points one way: `layout` knows nothing about word lists, `oracle` knows about
-both. That separation is the main design idea in the project, and it's also why the trait in
-"[Traits](#7-traits)" below exists.
+The dependency arrow points one way: `layout` knows nothing about word lists or themes, `theme`
+knows about `layout`, `oracle` knows about word lists. That separation is the main design idea in
+the project, and it's also why the trait in "[Traits](#7-traits)" below exists.
 
 ## Suggested order
 
@@ -34,7 +35,9 @@ both. That separation is the main design idea in the project, and it's also why 
 3. **The types at the top of [src/layout.rs](src/layout.rs)** — `Cell`, `Layout`, `Problem`.
 4. **`Layout::set` and the propagation rules** — `Result`, `?`, pattern matching.
 5. **[src/oracle.rs](src/oracle.rs)** — borrowing, caching, trait implementation.
-6. **[tests/layout.rs](tests/layout.rs)** — reads like a specification; each test is a small grid
+6. **[src/theme.rs](src/theme.rs)** — read *after* `layout.rs`, because it's the same search shape
+   applied to a different question, and the comparison is most of the value.
+7. **[tests/layout.rs](tests/layout.rs)** — reads like a specification; each test is a small grid
    with a comment saying what should happen.
 
 Skip [src/main.rs](src/main.rs) until last. It's the least interesting Rust.
@@ -352,18 +355,29 @@ Lifetimes are how the compiler proves a reference never outlives what it points 
 they're inferred and invisible. You write them when a struct *holds* a reference:
 
 ```rust
-struct SearchState<'a> {
+struct SearchState<'a, 'p> {
     problem: &'a Problem,
     on_candidate: &'a mut dyn FnMut(&Layout, &SearchStats) -> Flow,
+    on_progress: Option<&'p mut dyn FnMut(&SearchStats)>,
     // ...
 }
 ```
 
-`'a` is a name for "some lifetime". This says: a `SearchState<'a>` holds references that live at
-least as long as `'a`, so the compiler can reject any use of it after the `Problem` is gone.
+`'a` is a name for "some lifetime". This says: a `SearchState<'a, 'p>` holds references that live at
+least as long as those lifetimes, so the compiler can reject any use of it after the `Problem` is
+gone.
 
-You'll also see `impl SearchState<'_>` — `'_` means "there's a lifetime here, infer it, I don't need
-to name it."
+You'll also see `impl SearchState<'_, '_>` — `'_` means "there's a lifetime here, infer it, I don't
+need to name it."
+
+**Why two lifetimes rather than one.** The two callbacks are two separate `&mut` borrows made at the
+call site, and `&mut T` is *invariant* in `T`: the compiler will not quietly shorten one to match the
+other, the way it would for a shared `&T`. Forcing both into a single `'a` therefore asks the caller
+to prove its two borrows live exactly as long as each other, and `search`'s caller in
+[src/main.rs](src/main.rs) can't — one closure borrows the candidate pool, the other doesn't. A
+second lifetime parameter costs nothing and says what is actually true: the two borrows are
+unrelated. The error to recognise is `lifetime may not live long enough ... requirement occurs
+because of a mutable reference`.
 
 ### Splitting borrows
 
@@ -396,7 +410,65 @@ tracks borrows of *individual fields*, so mutating two different fields at once 
 call a *method* on `self`, the whole struct is borrowed — which is a common source of confusion, and
 why this function pokes at fields directly rather than calling helpers.
 
+`SearchState::report_progress` needs the same trick in a form that isn't optional:
+
+```rust
+let SearchState { on_progress, stats, .. } = self;
+if let Some(on_progress) = on_progress.as_deref_mut() {
+    on_progress(stats);
+}
+```
+
+Calling the closure needs `self.on_progress` mutably; passing it the counters needs `self.stats`
+immutably. Written as `self.on_progress...(&self.stats)` that's a mutable and a shared borrow of the
+same `self` at once, and it's rejected. Destructuring names the two fields separately, and the
+compiler can then see they don't overlap. `..` means "and ignore the rest".
+
 ---
+
+## 10. Two searches with the same shape
+
+[src/theme.rs](src/theme.rs) decides where the theme answers go, and [src/layout.rs](src/layout.rs)
+decides where the black squares go. They're different problems, but read them side by side and the
+skeleton is identical:
+
+| | `layout::search` | `theme::place` |
+| --- | --- | --- |
+| what it decides | one symmetry orbit at a time | one answer (or mirrored pair) at a time |
+| how it recurses | `SearchState::descend` | `Placer::descend` |
+| how it undoes | clones the `Layout` per node | writes letters, then `undo_move` |
+| when it gives up | node budget, then restart | node budget, then restart |
+| how it reports | `FnMut(&Layout, &SearchStats) -> Flow` | `FnMut(Placement) -> Flow` |
+
+Two things are worth noticing about that.
+
+**The `Flow` callback is the same type in both.** Neither search collects its results into a `Vec`
+and returns it; both hand each result to a closure that says `Continue` or `Stop`. That's what lets
+[src/main.rs](src/main.rs) stop a search the moment it has enough without either module knowing what
+"enough" means. It's also why the caller can hold state — the pool — that the search never sees.
+
+**They undo differently, on purpose.** `layout` clones its whole `Layout` at each node, because
+that's about 500 bytes and simpler than an undo trail. `theme` writes into a shared letter grid and
+takes the writes back, because its nodes are *pairs* of answers and a half-applied pair would leave
+the search in a state that violates its own invariant. Read `Placer::try_move` for the comment
+version of that argument: the all-or-nothing behaviour is the point, and the `Vec<usize>` of written
+squares is the whole undo log.
+
+### Where the layering shows up in the types
+
+```rust
+pub fn build_problem(template: &Template, settings: LayoutSettings) -> Result<(Problem, Layout), String>
+```
+
+`Template` is the handover point. `parse_template` produces one by reading characters; `theme::place`
+produces one by *choosing* where answers go. Both then go through `build_problem`, so the two entry
+paths cannot drift apart — the rule about what a theme answer's boundary looks like is written down
+once.
+
+That refactor is worth studying as a refactor. Before the theme layer existed, `parse_problem` did
+both jobs in one function, and there was no reason to separate them. Splitting it was the *whole* of
+what `layout.rs` needed to change to support a new layer above it. When a new feature needs almost no
+change to the code it sits on, the boundary was in the right place.
 
 ## Five things that look odd, and why
 

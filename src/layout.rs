@@ -82,6 +82,35 @@ pub struct ThemeEntry {
     pub answer: String,
 }
 
+impl ThemeEntry {
+    /// The flat indices this entry covers, in reading order.
+    #[must_use]
+    pub fn cells(&self, problem: &Problem) -> Vec<usize> {
+        let (x, y) = self.start;
+        (0..self.length)
+            .map(|i| match self.direction {
+                Direction::Across => problem.index(x + i, y),
+                Direction::Down => problem.index(x, y + i),
+            })
+            .collect()
+    }
+
+    /// The line this entry lies along -- its row if it is Across, its column if Down -- and the
+    /// half-open range it occupies along that line.
+    ///
+    /// Two entries are "parallel neighbours" when they share a direction, sit on nearby lines, and
+    /// their ranges overlap. That is the shape both the stacking rule and the spacing metric care
+    /// about, and it is easier to say once than to spell out per direction twice.
+    #[must_use]
+    pub fn line_and_span(&self) -> (usize, std::ops::Range<usize>) {
+        let (x, y) = self.start;
+        match self.direction {
+            Direction::Across => (y, x..x + self.length),
+            Direction::Down => (x, y..y + self.length),
+        }
+    }
+}
+
 /// Everything about the problem that is fixed for the whole search: dimensions, the theme letters,
 /// the settings, and precomputed geometry.
 #[derive(Debug, Clone)]
@@ -97,6 +126,34 @@ pub struct Problem {
 }
 
 impl Problem {
+    /// An empty problem of this size: correct geometry, no theme letters, no entries.
+    ///
+    /// The theme layer needs `partner`/`coord`/`index` before it has decided on any letters, and
+    /// those live here because they depend on the dimensions and the symmetry. So it builds one of
+    /// these first and fills `letters` in afterwards.
+    pub fn new(width: usize, height: usize, settings: LayoutSettings) -> Result<Problem, String> {
+        if width == 0 || height == 0 {
+            return Err("grid must have at least one row and one column".into());
+        }
+        if settings.min_entry_length < 2 {
+            return Err("minimum entry length must be at least 2".into());
+        }
+
+        let lines: Vec<Vec<usize>> = (0..height)
+            .map(|y| (0..width).map(|x| y * width + x).collect())
+            .chain((0..width).map(|x| (0..height).map(|y| y * width + x).collect()))
+            .collect();
+
+        Ok(Problem {
+            width,
+            height,
+            letters: vec![None; width * height],
+            settings,
+            theme_entries: vec![],
+            lines,
+        })
+    }
+
     #[must_use]
     pub fn cell_count(&self) -> usize {
         self.width * self.height
@@ -629,7 +686,42 @@ impl Layout {
     }
 }
 
-/// Parse an input template into a `Problem` and a propagated starting `Layout`.
+/// An input grid after its characters have been decoded, but before anything has been concluded
+/// from them.
+///
+/// This is the handover point between the two layers. [`parse_problem`] produces one by reading a
+/// template; the theme layer produces one by *choosing* where the answers go. Either way
+/// [`build_problem`] takes it from here, so the two paths cannot drift apart.
+#[derive(Debug, Clone)]
+pub struct Template {
+    pub width: usize,
+    pub height: usize,
+    /// Theme letters by flat index, `None` for every non-theme square.
+    pub letters: Vec<Option<char>>,
+    /// Squares the constructor fixed outright, `None` where they left the choice open.
+    pub fixed: Vec<Option<Cell>>,
+    /// Squares the constructor *wrote* as `.`. Only these count as opting out of theme-boundary
+    /// forcing; a square that merely ends up open for some other reason (symmetry, propagation) is a
+    /// conflict rather than an instruction.
+    pub explicitly_open: Vec<bool>,
+}
+
+impl Template {
+    /// An all-`?` grid: nothing fixed, no letters. What `--answers` starts from when there is no
+    /// input file to read.
+    #[must_use]
+    pub fn blank(width: usize, height: usize) -> Template {
+        Template {
+            width,
+            height,
+            letters: vec![None; width * height],
+            fixed: vec![None; width * height],
+            explicitly_open: vec![false; width * height],
+        }
+    }
+}
+
+/// Decode an input template's characters.
 ///
 /// | char | meaning |
 /// | --- | --- |
@@ -637,7 +729,7 @@ impl Layout {
 /// | `#` | forced block |
 /// | `.` | forced open, empty |
 /// | letter | forced open, fixed theme letter |
-pub fn parse_problem(input: &str, settings: LayoutSettings) -> Result<(Problem, Layout), String> {
+pub fn parse_template(input: &str) -> Result<Template, String> {
     let rows: Vec<Vec<char>> = input
         .lines()
         .map(str::trim)
@@ -653,35 +745,22 @@ pub fn parse_problem(input: &str, settings: LayoutSettings) -> Result<(Problem, 
     if rows.iter().any(|row| row.len() != width) {
         return Err("rows in grid must all be the same length".into());
     }
-    if settings.min_entry_length < 2 {
-        return Err("minimum entry length must be at least 2".into());
-    }
 
-    let lines: Vec<Vec<usize>> = (0..height)
-        .map(|y| (0..width).map(|x| y * width + x).collect())
-        .chain((0..width).map(|x| (0..height).map(|y| y * width + x).collect()))
-        .collect();
-
-    let mut letters: Vec<Option<char>> = vec![None; width * height];
-    let mut initial: Vec<Option<Cell>> = vec![None; width * height];
-    // Squares the constructor *wrote* as `.`. Only these count as opting out of theme-boundary
-    // forcing; a square that merely ends up open for some other reason (symmetry, propagation) is a
-    // conflict rather than an instruction.
-    let mut explicitly_open: Vec<bool> = vec![false; width * height];
+    let mut template = Template::blank(width, height);
 
     for (y, row) in rows.iter().enumerate() {
         for (x, &ch) in row.iter().enumerate() {
             let idx = y * width + x;
             match ch {
                 '?' => {}
-                '#' => initial[idx] = Some(Cell::Block),
+                '#' => template.fixed[idx] = Some(Cell::Block),
                 '.' => {
-                    initial[idx] = Some(Cell::Open);
-                    explicitly_open[idx] = true;
+                    template.fixed[idx] = Some(Cell::Open);
+                    template.explicitly_open[idx] = true;
                 }
                 ch if ch.is_alphanumeric() => {
-                    initial[idx] = Some(Cell::Open);
-                    letters[idx] = Some(ch.to_lowercase().next().unwrap());
+                    template.fixed[idx] = Some(Cell::Open);
+                    template.letters[idx] = Some(ch.to_lowercase().next().unwrap());
                 }
                 other => {
                     return Err(format!(
@@ -692,20 +771,31 @@ pub fn parse_problem(input: &str, settings: LayoutSettings) -> Result<(Problem, 
         }
     }
 
-    let mut problem = Problem {
-        width,
-        height,
-        letters,
-        settings,
-        theme_entries: vec![],
-        lines,
-    };
+    Ok(template)
+}
+
+/// Parse an input template into a `Problem` and a propagated starting `Layout`.
+pub fn parse_problem(input: &str, settings: LayoutSettings) -> Result<(Problem, Layout), String> {
+    build_problem(&parse_template(input)?, settings)
+}
+
+/// Work out what a template implies: which letter runs are theme answers, where their boundary
+/// blocks go, and everything propagation can conclude from that.
+///
+/// Runs the whole geometry layer's opening move, so a theme placement that can't work is rejected
+/// here with a reason rather than discovered later as an empty search.
+pub fn build_problem(
+    template: &Template,
+    settings: LayoutSettings,
+) -> Result<(Problem, Layout), String> {
+    let mut problem = Problem::new(template.width, template.height, settings)?;
+    problem.letters.clone_from(&template.letters);
 
     problem.theme_entries = infer_theme_entries(&problem)?;
 
     let mut layout = Layout::new(&problem);
 
-    for (idx, initial_cell) in initial.iter().enumerate() {
+    for (idx, initial_cell) in template.fixed.iter().enumerate() {
         if let Some(cell) = *initial_cell {
             layout
                 .set(&problem, idx, cell)
@@ -724,7 +814,7 @@ pub fn parse_problem(input: &str, settings: LayoutSettings) -> Result<(Problem, 
 
         // Writing `.` just past the end of a run says "this run is part of a longer entry", so we
         // leave the boundary alone and stop treating the run as an entry of its own.
-        if boundaries.iter().any(|&idx| explicitly_open[idx]) {
+        if boundaries.iter().any(|&idx| template.explicitly_open[idx]) {
             continue;
         }
 
@@ -779,7 +869,10 @@ fn conflict_message(problem: &Problem, idx: usize) -> String {
 }
 
 /// The squares immediately before and after a theme entry, omitting any that fall off the grid.
-fn theme_boundary_indices(problem: &Problem, theme: &ThemeEntry) -> Vec<usize> {
+///
+/// These are the squares that have to be blocks for the answer to be an entry in its own right, so
+/// the theme layer checks them before committing to a position and this module forces them after.
+pub(crate) fn theme_boundary_indices(problem: &Problem, theme: &ThemeEntry) -> Vec<usize> {
     let (x, y) = theme.start;
     let mut result = vec![];
     match theme.direction {
@@ -918,6 +1011,17 @@ pub struct SearchSettings {
     /// yields no legal topology at all would otherwise restart forever without ever handing the
     /// caller a chance to stop.
     pub deadline: Option<Instant>,
+    /// Abandon the search after this many consecutive restarts that turn up nothing new.
+    ///
+    /// A restart that uses up its whole node budget proves nothing -- the space might be rich and
+    /// we were unlucky, or it might be all but empty. Without a limit the two are indistinguishable
+    /// and the search restarts until the clock stops it, which is fine when there is one problem to
+    /// solve and ruinous when there are twelve: the first barren one quietly spends everybody's
+    /// budget. The usual cause is not the geometry at all but the word list, rejecting every entry
+    /// the geometry manages to build.
+    ///
+    /// `None` restarts until the deadline, which is the right behaviour for a single search.
+    pub barren_restart_limit: Option<usize>,
     /// How often to call the progress callback. `None` never calls it.
     ///
     /// Progress has to be reported from inside the search for the same reason the deadline is
@@ -933,6 +1037,7 @@ impl Default for SearchSettings {
             candidates_per_restart: 1,
             seed: 0,
             deadline: None,
+            barren_restart_limit: None,
             progress_interval: None,
         }
     }
@@ -950,6 +1055,11 @@ pub struct SearchStats {
     /// own pool, but the progress callback can't see that pool -- it is borrowed by the candidate
     /// callback -- so the count lives here.
     pub candidates: usize,
+    /// Whether the search stopped because it hit `barren_restart_limit` rather than because it
+    /// finished, was told to stop, or ran out of time. Distinguishing them is the whole point: a
+    /// search that gave up here has proved nothing, and the caller is the one who can say what to
+    /// do about it.
+    pub gave_up_barren: bool,
 }
 
 /// Sample legal topologies, calling `on_candidate` with each distinct one.
@@ -985,6 +1095,8 @@ pub fn search(
         on_progress,
     };
 
+    let mut barren_restarts = 0;
+
     loop {
         state.node_budget = settings.nodes_per_restart;
         state.candidates_this_restart = 0;
@@ -1000,6 +1112,21 @@ pub fn search(
         // nothing left to restart into.
         if state.node_budget > 0 && state.candidates_this_restart < state.candidates_per_restart {
             break;
+        }
+
+        // Otherwise the budget ran out, which says nothing either way -- so count how long it has
+        // been since this search last produced anything, and give up if the caller set a limit.
+        if state.candidates_this_restart > 0 {
+            barren_restarts = 0;
+        } else {
+            barren_restarts += 1;
+            if settings
+                .barren_restart_limit
+                .is_some_and(|limit| barren_restarts >= limit)
+            {
+                state.stats.gave_up_barren = true;
+                break;
+            }
         }
     }
 
