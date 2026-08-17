@@ -11,3 +11,4 @@
 pub mod layout;
 pub mod oracle;
 pub mod score;
+pub mod theme;

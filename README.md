@@ -1,7 +1,7 @@
 # ingrid_layout
 
-Given a crossword grid with only the theme answers placed, work out where the black squares go so
-the finished grid is both legal and fillable.
+Given a crossword theme — either a list of answers, or a grid with them already placed — work out
+where the answers and the black squares go so the finished grid is both legal and fillable.
 
 [`ingrid_core`](https://github.com/rf-/ingrid_core) fills a *fixed* grid topology — you give it a
 template, it derives the Across/Down slots and solves for the words. Block placement isn't one of its
@@ -32,6 +32,26 @@ rebus squares in theme answers, point its `branch` at `rebus-support`.
 
 ## Usage
 
+Two ways in. Either hand it a list of answers and let it choose where they go:
+
+```
+$ cat theme.txt
+Sleight Of Hand
+Defenestrated
+Intimate Apparel
+
+$ ingrid_layout --answers theme.txt --size 15x15 --count 3
+```
+
+One answer per line. Blank lines and `#` comments are skipped, and spaces and punctuation are
+dropped, so `Sleight Of Hand` and `sleightofhand` mean the same thing.
+
+This mode has more to search than the one below — arrangements as well as block patterns — so it
+wants a longer `--timeout`, and it's worth trying `--min-score 40` sooner than you otherwise would.
+See [Where it struggles](#where-it-struggles) for the measurements behind that.
+
+Or place them yourself in a grid and let it do only the black squares:
+
 ```
 $ cat theme.txt
 ???????????????
@@ -53,7 +73,16 @@ goingintodetail
 $ ingrid_layout theme.txt --count 3
 ```
 
-Each cell of the input is one character:
+The two combine: pass both a grid file and `--answers`, and the answers are placed into whatever the
+grid leaves undecided, respecting the blocks and letters you already pinned. `--size` is only needed
+when there is no grid file to take the dimensions from.
+
+Output is `--count` grids, best first, each with its block pattern, a completed fill, and the metrics
+behind its score.
+
+### Placing the answers yourself
+
+Each cell of the input grid is one character:
 
 | char | meaning |
 | --- | --- |
@@ -76,12 +105,38 @@ Two kinds of letter run are *not* read as answers, because they can't be:
 A run that survives both tests but is shorter than `--min-entry-length` is reported as an error,
 since it was evidently meant as an answer and can't legally be one.
 
-Output is `--count` grids, best first, each with its block pattern, a completed fill, and the metrics
-behind its score.
+### Symmetry, and why `--answers` can refuse
+
+Under 180-degree symmetry, a theme entry's mirror is an entry of exactly the same length. Whatever
+goes there has to be *something*, so the choice is between another theme answer and an ordinary one —
+and an ordinary one is both a wasted theme slot and an unusually long entry to have to fill. So by
+default every answer must be mirrored by another answer, which means:
+
+- Answers pair up **by length**. Two 13s can mirror each other; a 13 and an 11 cannot.
+- A length with an **odd** number of answers has to put one of them dead centre, in the position that
+  is its own mirror. In a 15×15 that's the middle row, centred — so a lone 13 goes to row 7, columns
+  1–13, and there is nowhere else it can go.
+
+Two consequences worth knowing before the tool tells you:
+
+- **Two answers of different lengths, each unpaired, both want the centre line** and collide. A 15
+  and a 13 on their own have no legal arrangement at all.
+- **An even-length answer has no centred position in an odd-width grid.** A 12 in a 15-wide grid
+  would have to start at column 1.5.
+
+`--loose-theme-symmetry` is the escape hatch: it lets an answer's mirror be an ordinary entry, which
+is what a constructor does when the lengths don't cooperate. The error message says which of these
+you hit.
 
 ### Options
 
 ```
+--answers PATH                      theme answers to place, one per line
+--size 15x15                        grid size for --answers when there's no grid file
+--theme-pool 12                     theme placements to sample before ranking them
+--loose-theme-symmetry              let an answer's mirror be an ordinary entry
+--theme-down                        let answers run Down as well as Across
+--stacked-themes                    allow theme answers on adjacent rows
 --min-blocks / --max-blocks         block count range
 --max-words                         most entries allowed
 --max-short-entries                 most three-letter entries; lower is better but yields fewer grids
@@ -148,7 +203,9 @@ Two things to know before leaving one running:
   up its node budget, and for a theme with legal-but-very-rare topologies that can repeat
   indefinitely with nothing to stop it. The sampling progress line is the tell: nodes and restarts
   climbing while the topology count stays at 0. Interrupt it and loosen `--max-short-entries` or the
-  block bounds.
+  block bounds. (With `--answers` there is a cutoff, because there are other placements waiting to
+  be tried; with a single hand-placed grid there is nothing else to spend the time on, so the search
+  keeps going and the clock is the only bound.)
 - Removing the clock doesn't turn a `timed out` verdict into an answer. Each grid still gets
   `--fill-timeout` seconds and no more, so raise that too if the counters show fills timing out.
 
@@ -173,6 +230,70 @@ Bigger grids are also much slower to fill — not proportionally but closer to q
 so expect a 21×21 to want a longer `--timeout` as well.
 
 ## How it works
+
+Three layers, each producing the next one's input:
+
+```
+answers → theme placement → template → block search → topologies → fill
+```
+
+**Theme placement** (`theme.rs`, no knowledge of any word list). Only runs with `--answers`; a grid
+file that already has the answers in it starts at the block search.
+
+Down in the block search, 180-degree symmetry is *free* — every square is written together with its
+rotational partner, so nothing asymmetric can be produced. That's legal symmetry, and it isn't what a
+constructor means by the word. They mean the answers mirror *each other*, and that's what this layer
+enforces, which turns placement into pairing answers by length and choosing one position per pair
+(the second is then determined). A length with an odd number of answers has to put one of them in the
+self-mirroring position, dead centre.
+
+Like the block search it's a sampler with randomised restarts, because three answers in a 15×15 have
+hundreds of thousands of legal homes and we want a dozen. Each candidate is run through the block
+layer's opening move — boundary blocks plus full propagation — so a placement only reaches the caller
+if it's something the block search can actually start from.
+
+Placements are then ranked before any blocks are tried, on four things:
+
+- **Whether each answer is flush against a wall.** Constructors put theme answers hard against
+  alternating walls — one flush left, the next flush right. An answer against a wall needs a boundary
+  block on one side only, and the leftovers past it form a straight run of blocks reaching in from
+  the *other* wall, which is a useful structure. The same answer moved one square inward pays for two
+  boundary blocks and cuts both edge columns for nothing. Under 180° symmetry the alternation is
+  free: the mirror of a flush-left answer is a flush-right one.
+- **How many squares propagation has already blackened.** This replaced a pile of hand-rolled
+  geometry, all of which was trying to approximate something propagation computes exactly and for
+  free. A 12-letter answer on row 2 of a 15×15 piles its boundary blocks into a corner and strands
+  the 3×2 patch outside them; the same answer on row 5 strands nothing.
+- **The tightest run of non-theme lines anywhere in the grid, counting the room to the edges.** Theme
+  rows at 1/7/13 of a 15×15 have the same gaps between them as rows at 3/7/11, but leave a single row
+  above and below.
+- **Whether any answer sits in the outermost two lines.** Rows 1 and 2, counting from 1. The first is
+  crossed on one side only; the second pins every down entry crossing it within a square of the wall.
+
+The first of those is the biggest single lever, and it was measurable: with it the tool's grids for
+the example theme fill at the default `--min-score 50`, and without it the same theme needed
+`--min-score 40`.
+
+`--pool` is split evenly among the placements, and each gets its own slice of the sampling deadline —
+that slice is what stops one placement whose topologies are rare from grinding away and spending
+everybody else's budget. A placement is also abandoned outright after a long run of restarts that
+turn up nothing, but that is a backstop rather than the main bound, and deliberately generous:
+needing 30-odd restarts to find a first topology is entirely normal on a tight theme, so a cutoff
+tight enough to be "efficient" just discards working placements and reports them as hopeless.
+
+The progress lines show it either way — the tell is nodes and restarts climbing while the topology
+count stays at zero:
+
+```
+[ 15s] theme placement 3 of 12: 0 topologies in 12 restarts, gave up (nothing legal turning up)
+[ 15s] theme placement 4 of 12: 42 topologies in 42 restarts
+```
+
+A run that loses placements this way says so at the end. **The diagnostic is `--emit-templates`**: it
+runs the identical geometry search with the word list unplugged, in seconds. Plenty of topologies
+there and none in the real run means the dictionary is the wall, and `--min-score` is the knob.
+Nothing there either means the geometry is over-constrained — usually the block bounds, especially
+when a partial grid already pins blocks — and no `--min-score` will help.
 
 **Geometry search** (`layout.rs`, no knowledge of any word list). Squares are three-valued —
 undecided, open, or block — and decisions are made per *symmetry orbit* rather than per square, so
@@ -207,6 +328,29 @@ a usable grid from an ugly one: short-entry count, long entries, cheater squares
 wouldn't change the word count), block clumping, word count, and entries crossing two or more theme
 answers. Grids are ranked on geometry *first*, so the expensive fill attempts are spent on the most
 promising ones.
+
+One metric here is worth explaining, because it encodes a constructor's rule of thumb rather than a
+legality requirement: **pairs of blocks sharing an edge**. A block earns its keep by cutting a row
+*and* a column; two blocks side by side cut the same row twice and waste half of one. So the count of
+shared edges scores exactly the arrangements constructors rate, with no special cases —
+
+| arrangement | blocks | shared edges |
+|---|---|---|
+| scattered singles | 4 | 0 |
+| diagonal line | 4 | 0 |
+| straight interior line | 4 | 3 |
+| solid 2×2 | 4 | 4 |
+
+— which is why straight lines and solid rectangles leave a grid heavily blacked-in and still hard to
+fill. **Fingers are exempt**, and have to be: a finger is a straight run of blocks reaching in from a
+side wall, they cannot be drawn diagonally, and a grid needs several, so charging them for being
+straight would have the metric fighting the grid's own skeleton. A run that touches a wall isn't
+counted.
+
+The evidence that this measures the right thing: the published grid this crate calibrates against has
+**2** shared edges across 32 blocks, while grids our own search ranks highest have 2 to 8. The finger
+count is reported alongside it but not scored — the rule of thumb is about three per side for a
+Sunday, but one real puzzle isn't enough to fix a weight with.
 
 **Filling** (`oracle.rs`). The only module that touches a word list. It builds a `GridConfig` and
 calls `find_fill`. Two things make this affordable:
@@ -262,6 +406,47 @@ of the grids the solver rejected so you can see what it's up against.
 
 ## Where it struggles
 
+**Which answer goes in which slot is a word-list question, and `--answers` ranks placements on
+geometry.** This is the sharpest limitation of the theme layer, and it is worth stating with the
+measurement that found it. Take the four answers of the example theme and the published grid's
+arrangement — the 15s on rows 2 and 12, the 12s on rows 5 and 9:
+
+| arrangement | topologies sampled | filled |
+|---|---|---|
+| published (`intimateapparel` row 2, `wisterialane` row 5, …) | 500 | 2 of the first 28 tried |
+| same rows and columns, the four answers permuted | 500 | **0 of 500** |
+
+Identical geometry. Every geometric metric in this tool scores the two placements the same, because
+by every geometric measure they *are* the same — the difference is entirely which letters end up
+pinned in which columns, and only the solver can see that. So the theme layer samples arrangements,
+ranks them on geometry, and leaves the fill attempts to sort out what geometry can't.
+
+How much that costs you turns out to depend less on the word list than on how good the *geometry* of
+the chosen arrangement is, which is worth recording because the first two attempts to fix it went the
+wrong way. The same four answers, placed by `--answers` rather than by hand:
+
+| | result |
+|---|---|
+| ranking without the wall-anchoring rule, `--min-score 50` | 766 topologies over 30 placements, none filled |
+| the same, `--min-score 40` | 2 filled, out of the first 5 topologies tried |
+| **with wall anchoring and wider placement sampling, `--min-score 50`** | **fills at the default quality bar** |
+
+Two separate causes were hiding behind one symptom. The ranking preferred answers floating a square
+clear of the wall, which is the arrangement a constructor never picks; and it was choosing from only
+120 sampled placements out of some hundreds, so the arrangement it *would* have ranked first was
+often never generated at all. Under-sampling looks exactly like a bad metric from the outside, which
+is why it is worth ruling out first.
+
+What remains true regardless:
+
+- **If you already know which answer you want where, say so.** Writing them into a grid file is much
+  cheaper than making the tool rediscover it, and the two modes combine — pin the placements you care
+  about and let `--answers` place the rest.
+- **`--min-score 40` is still the first knob to reach for** when a theme won't fill, since the word
+  list is the binding constraint for anything densely themed.
+
+
+
 Heavily themed 21×21s. A Sunday with four or five long theme rows pins letters in every column, and
 with the bundled word list the sampled grids come back *proven* unfillable at arc consistency — not
 timed out, but shown to have no fill at all. Two things are working against it:
@@ -282,14 +467,16 @@ minutes. It's a genuinely harder problem than a 15×15, not just a bigger one.
 file does, which language ideas it uses, and a set of exercises that change something real.
 
 ```
-cargo test          # 24 tests; the geometry ones need no word list and run in well under a second
+cargo test          # 51 tests; the geometry and theme ones need no word list and run in a fraction of a second
 cargo clippy --all-targets
 ```
 
 `tests/layout.rs` covers the geometry layer on its own, including a property test that samples
 hundreds of grids and asserts every one satisfies symmetry, minimum entry length, checked squares,
-connectivity, theme boundaries and the count bounds. `tests/pipeline.rs` covers scoring and filling
-against the published grid.
+connectivity, theme boundaries and the count bounds. `tests/score.rs` covers the ranking metrics as claims about block shapes.
+`tests/theme.rs` covers the placement layer,
+including that everything it emits is something the block search can start from.
+`tests/pipeline.rs` covers scoring and filling against the published grid.
 
 ## Acknowledgments
 

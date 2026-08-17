@@ -104,6 +104,13 @@ fn metrics_match_the_published_grid() {
     // zero here on a real grid is the main evidence that the cheater metric means what it claims.
     assert_eq!(metrics.cheater_squares, 0);
 
+    // Constructors spend the block budget on diagonals, scattered singles and fingers, and avoid
+    // interior straight lines and rectangles. If that is true, a real grid should barely register
+    // here -- and this one has two shared edges across thirty-two blocks, against six to eight for
+    // grids our own search likes. That gap is the evidence the metric measures the right thing.
+    assert_eq!(metrics.block_adjacencies, 2);
+    assert_eq!(metrics.side_fingers, 4);
+
     // And it should comfortably beat what our own search produces, which scores around -11 to -40.
     let score = metrics.geometric_score(&Weights::default());
     assert!(score > -10.0, "published grid scored {score}");
@@ -187,6 +194,7 @@ fn the_search_rediscovers_a_fillable_grid_for_the_published_theme() {
             candidates_per_restart: 1,
             seed: 0,
             deadline: Some(std::time::Instant::now() + Duration::from_secs(30)),
+            barren_restart_limit: None,
             progress_interval: None,
         },
         Some(&mut oracle as &mut dyn EntryViability),
